@@ -1,0 +1,303 @@
+---
+title: "Coping Strategies and Resilience Among Displaced Youth in Bidibidi Settlement"
+author: "Raymond Atwebembere, Isaac"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# 0. Load/install packages
+if (!requireNamespace("pacman", quietly=TRUE)) install.packages("pacman")
+pacman::p_load(
+  glue, readxl, dplyr, gtsummary, gt, MASS, brant, car, pROC, nnet, ggplot2
+)
+
+# For glue ≥1.8.0 compatibility, restart R after install if needed
+```
+
+```{r}
+# 1. Read the data
+df <- readxl::read_excel("/Users/ray/Desktop/Isaac/PCMR Data set.xlsx")
+
+# 2. Data managemet
+df <- df %>%
+  mutate(
+    PCMR_total     = rowSums(across(PCMR1:PCMR8),   na.rm = TRUE),
+    EFCR_total     = rowSums(across(EFCR1:EFCR9),   na.rm = TRUE),
+    SSCR_total     = rowSums(across(SSCR1:SSCR8),   na.rm = TRUE),
+    RQ_total       = rowSums(across(RQ1:RQ10),      na.rm = TRUE),
+    SPQ_total      = rowSums(across(SPQ1:SPQ8),     na.rm = TRUE),
+    Gender         = factor(Gender,         levels=1:2, labels=c("Male","Female")),
+    Age            = factor(Age,            levels=1:4, labels=c("18–24","25–34","35–44","45+")),
+    Educationlevel = factor(Educationlevel, levels=1:6, labels=c("Primary","O'Level","A'Level","Diploma","Bachelor","Master")),
+    MaritalStatus  = factor(MaritalStatus,  levels=1:3, labels=c("Single","Married","Separated/Divorced")),
+    Yearsincamp    = factor(Yearsincamp,    levels=1:2, labels=c("1–2 yrs",">2 yrs")),
+    ZoneinBidibidi = factor(ZoneinBidibidi, levels=1:5, labels=paste("Zone",1:5)),
+    ScreeningForm  = factor(ScreeningForm,
+                            levels=sort(unique(ScreeningForm)),
+                            labels=paste("Form", sort(unique(ScreeningForm)))),
+    RQ_group       = cut(RQ_total,
+                         breaks = quantile(RQ_total, probs=c(0,0.33,0.66,1), na.rm=TRUE),
+                         include.lowest = TRUE,
+                         labels = c("Low RQ","Med RQ","High RQ"))
+  )
+```
+
+```{r}
+# 1. Start from df, drop high‐ed levels, collapse Age & Education in one pipeline:
+df2 <- df %>%
+  # keep only Primary/O'Level/A'Level
+  filter(Educationlevel %in% c("Primary","O'Level","A'Level")) %>%
+  # collapse and relabel
+  mutate(
+    Age = fct_collapse(
+      Age,
+      `18–24` = "18–24",
+      `25+`   = c("25–34","35–44","45+")
+    ),
+    Educationlevel = fct_collapse(
+      Educationlevel,
+      Primary   = "Primary",
+      Secondary = c("O'Level","A'Level")
+    )
+  ) %>%
+  # now drop any leftover unused levels in both factors
+  mutate(
+    Age = droplevels(Age),
+    Educationlevel = droplevels(Educationlevel)
+  )
+```
+
+```{r}
+# 3. Build Table 1 with explicit dplyr::select()
+tbl1 <- df2 %>%
+  dplyr::select(
+    RQ_group,
+    Gender, Age, Educationlevel, MaritalStatus,
+    PCMR_total, EFCR_total, SSCR_total, SPQ_total
+  ) %>%
+  gtsummary::tbl_summary(
+    by = RQ_group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ± {sd}",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    label = list(
+      Gender         ~ "Gender",
+      Age            ~ "Age",
+      Educationlevel ~ "Education Level",
+      MaritalStatus  ~ "Marital Status",
+      PCMR_total     ~ "PCMR Total",
+      EFCR_total     ~ "EFCR Total",
+      SSCR_total     ~ "SSCR Total",
+      SPQ_total      ~ "SPQ Total"
+    ),
+    missing = "no"
+  ) %>%
+  gtsummary::add_overall(last = TRUE)
+
+gt1 <- tbl1 %>%
+  as_gt() %>%
+  tab_header(title = md("**Table 1. Sample Characteristics by Resilience Group**")) %>%
+  tab_style(style = cell_text(weight="bold"), locations = cells_column_labels())
+
+print(gt1)
+
+# Save to Desktop
+gtsave(gt1, "/Users/ray/Desktop/Table1_PCMR.docx")
+```
+
+```{r}
+# 3. Re-fit the ordinal logistic model
+fit_ord <- polr(
+  RQ_group ~ PCMR_total + EFCR_total + SSCR_total + SPQ_total +
+    Gender + Age + Educationlevel + MaritalStatus,
+  data = df2,
+  Hess = TRUE
+)
+
+# 4. Summarize & check dropped coefficients
+summary(fit_ord)
+```
+
+```{r}
+# 5. Proportional‐odds test
+brant(fit_ord)
+```
+
+```{r}
+# 1. Rank-deficiency check
+mm <- model.matrix(
+  ~ PCMR_total + EFCR_total + SSCR_total + SPQ_total
+    + Gender + Age + Educationlevel + MaritalStatus,
+  data = df2
+)
+rk <- qr(mm)$rank
+nc <- ncol(mm)
+cat("Design matrix rank:", rk, "of", nc, "columns\n")
+# If rk < nc, some columns are aliased—use alias(fit_ord2) to see which.
+```
+
+```{r}
+# 2. Proportional-odds assumption (Brant test)
+library(brant)
+brant_res <- brant(fit_ord)
+print(brant_res)
+# H0: parallel-lines holds. p>0.05 ⇒ assumption OK.
+```
+
+```{r}
+# 3. Multicollinearity: VIF via a linear proxy
+library(car)
+lin_mod <- lm(
+  as.numeric(RQ_group) ~ PCMR_total + EFCR_total + SSCR_total + SPQ_total
+    + Gender + Age + Educationlevel + MaritalStatus,
+  data = df2
+)
+vif_vals <- vif(lin_mod)
+print(vif_vals)
+# VIF < 5 (or <10) ⇒ multicollinearity not severe.
+```
+
+
+```{r}
+library(broom)
+library(dplyr)
+library(knitr)
+
+# 1. Tidy the polr object, exponentiate for ORs + CIs
+tidy_ord <- broom::tidy(
+  fit_ord,
+  conf.int     = TRUE,
+  conf.level   = 0.95,
+  exponentiate = TRUE
+)
+
+# 2. Drop the threshold terms (they contain a "|" in their names)
+tidy_slopes <- tidy_ord %>%
+  filter(! grepl("\\|", term))  # removes "Low RQ|Med RQ" etc.
+
+# 3. Compute Wald p-values
+coef_tbl <- tidy_slopes %>%
+  mutate(
+    `t value` = statistic,
+    `p value` = 2 * pnorm(-abs(statistic)),
+    CI        = sprintf("%.2f–%.2f", conf.low, conf.high)
+  ) %>%
+  dplyr::select(
+    Term         = term,
+    OR           = estimate,
+    CI,
+    `Std. Error` = std.error,
+    `t value`,
+    `p value`
+  )
+
+# 4. Print neatly
+knitr::kable(coef_tbl, digits = 3,
+             caption = "Ordinal Logit: ORs (95% CI) & p-values")
+```
+
+```{r}
+# 5. Likelihood‐ratio test vs. intercept‐only model (on collapsed data / fit_ord)
+#    Build the null (intercept‐only) model
+null_mod2 <- update(fit_ord, . ~ 1)
+
+#    Compare with your full model
+lr2 <- anova(null_mod2, fit_ord)
+
+#    Print out the LR χ², df, and p‐value
+print(lr2)
+```
+
+```{r}
+library(broom)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# 1. Tidy & exponentiate
+tidy_ord <- broom::tidy(fit_ord, exponentiate = TRUE, conf.int = TRUE)
+
+# 2. Keep slopes only and relabel them
+tidy_slopes <- tidy_ord %>%
+  filter(! grepl("\\|", term)) %>%
+  mutate(
+    term = fct_recode(
+      term,
+      "Problem‐Focused Coping"        = "PCMR_total",
+      "Emotion‐Focused Coping"        = "EFCR_total",
+      "Social‐Support Coping"         = "SSCR_total",
+      "Spiritual Practice"            = "SPQ_total",
+      "Female vs Male"                = "GenderFemale",
+      "Age 25+ vs 18–24"              = "Age25+",
+      "Secondary vs Primary Education"= "EducationlevelSecondary",
+      "Married vs Single"             = "MaritalStatusMarried",
+      "Separated/Divorced vs Single"  = "MaritalStatusSeparated/Divorced"
+    ),
+    term = fct_relevel(
+      term,
+      "Problem‐Focused Coping",
+      "Emotion‐Focused Coping",
+      "Social‐Support Coping",
+      "Spiritual Practice",
+      "Female vs Male",
+      "Age 25+ vs 18–24",
+      "Secondary vs Primary Education",
+      "Married vs Single",
+      "Separated/Divorced vs Single"
+    )
+  )
+
+# 3. Plot
+ggplot(tidy_slopes, aes(x = estimate, y = term)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  scale_x_log10() +
+  labs(
+    x = "Odds Ratio (log scale)",
+    y = "",
+    title = "Forest Plot of Odds Ratios",
+    subtitle = "Proportional‐odds ordinal logistic regression"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(pROC)
+
+# 1. Get predicted probabilities for each RQ_group
+pred_probs2 <- predict(fit_ord, newdata = df2, type = "probs")
+
+# 2. Save the “High RQ” probability
+df2 <- df2 %>% mutate(pred_high = pred_probs2[,"High RQ"])
+
+# 3. Build calibration data by decile of pred_high
+calib <- df2 %>%
+  mutate(decile = ntile(pred_high, 10)) %>%
+  group_by(decile) %>%
+  summarize(
+    mean_pred = mean(pred_high),
+    obs_rate  = mean(RQ_group == "High RQ"),
+    n = n(),
+    .groups = "drop"
+  )
+
+# 4. Plot calibration
+ggplot(calib, aes(x = mean_pred, y = obs_rate)) +
+  geom_point(aes(size = n), color = "steelblue") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  scale_size_area(max_size = 5) +
+  labs(
+    x = "Mean predicted P(High RQ)",
+    y = "Observed proportion High RQ",
+    title = "Calibration Plot (by Decile of Predicted Risk)"
+  ) +
+  theme_minimal()
+```
+
